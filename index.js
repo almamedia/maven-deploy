@@ -1,35 +1,48 @@
 var fs = require('fs');
 var path = require('path');
+var walk = require('fs-walk');
+var JSZip = require('jszip');
 var extend = require('util-extend');
 var exec = require('child_process').exec;
 var defineOpts = require('define-options');
 var semver = require('semver');
-var archiver = require('archiver');
 
-var config = {
+var config, pkg, validateConfig, validateRepos, validateRepo;
+init();
+validateConfig = defineOpts({
+    groupId       : 'string   - the Maven group id.',
+    artifactId    : '?|string - the Maven artifact id. default "' + config.artifactId + '".',
+    buildDir      : '?|string - build directory. default "' + config.buildDir + '".',
+    finalName     : '?|string - the final name of the file created when the built project is packaged. default "' +
+                    config.finalName + '"',
+    type          : '?|string - "jar" or "war". default "' + config.type + '".',
+    fileEncoding  : '?|string - valid file encoding. default "' + config.fileEncoding + '"'
+}),
+validateRepos = defineOpts({
+    repositories  : 'object[] - array of repositories, each with id and url to a Maven repository'
+}),
+validateRepo = defineOpts({
+    id            : 'string   - the Maven repository id',
+    url           : 'string   - URL to the Maven repository'
+});
+
+function init () {
+    config = {
+        artifactId: '{name}',
         buildDir: 'dist',
         finalName: '{name}',
         type: 'war',
         fileEncoding: 'utf-8'
     },
-    validateConfig = defineOpts({
-        groupId       : 'string   - the Maven group id.',
-        buildDir      : '?|string - build directory. default "' + config.buildDir + '".',
-        finalName     : '?|string - the final name of the file created when the built project is packaged. default "' +
-                        config.finalName + '"',
-        type          : '?|string - "jar" or "war". default "' + config.type + '".',
-        fileEncoding  : '?|string - valid file encoding. default "' + config.fileEncoding + '"'
-    }),
-    validateRepos = defineOpts({
-        repositories  : 'object[] - array of repositories, each with id and url to a Maven repository'
-    }),
-    validateRepo = defineOpts({
-        id            : 'string   - the Maven repository id',
-        url           : 'string   - URL to the Maven repository'
-    }),
-    pkg = JSON.parse(fs.readFileSync('./package.json', config.fileEncoding));
+    pkg = readPackageJSON();
+}
+
+function readPackageJSON () {
+    return JSON.parse(fs.readFileSync('./package.json', config.fileEncoding));
+}
 
 function filterConfig () {
+    // replace {key} in config with value from package.json
     Object.keys(config).forEach(function (key) {
         var value = config[key];
         if (typeof value != 'string') { return; }
@@ -46,12 +59,11 @@ function archivePath () {
 }
 
 function mvnArgs (repoId, isSnapshot) {
-    var pkg = JSON.parse(fs.readFileSync('./package.json', config.fileEncoding));
     var args = {
         packaging    : config.type,
         file         : archivePath(),
         groupId      : config.groupId,
-        artifactId   : pkg.name,
+        artifactId   : config.artifactId,
         version      : pkg.version
     };
     if (repoId) {
@@ -93,7 +105,7 @@ function command (cmd, done) {
 }
 
 function mvn (args, repoId, isSnapshot, done) {
-    command('mvn ' + args.concat(mvnArgs(repoId, isSnapshot)).join(' '), done);
+    command('mvn -B ' + args.concat(mvnArgs(repoId, isSnapshot)).join(' '), done);
 }
 
 function exit(){
@@ -108,30 +120,22 @@ var maven = {
     },
 
     package: function (done) {
+        var archive = new JSZip();
 
-        var output = fs.createWriteStream(archivePath());
-        output.on('error', function(err){
-            console.error('Could not create archive an path ' + archivePath(), err);
-            exit();
-        });
-        output.on('open', function(){
-
-            var archive;
-            if(config.type === 'war' || config.type == 'jar') {
-                archive = archiver('zip');
-            } else if (config.type === 'tar.gz') {
-                archive = archiver('tar', { gzip: true });
-            } else {
-                archive = archiver(config.type);
+        walk.walkSync(config.buildDir, function (base, file, stat) {
+            if (stat.isDirectory() || file.indexOf(config.finalName + '.' + config.type) === 0) {
+                return;
             }
-
-            archive.pipe(output);
-            archive.bulk([
-                { expand: true, cwd: config.buildDir, src: ['**', '!' + config.finalName + '.' + config.type] }
-            ]);
-            archive.finalize();
-            if (done) { done(); }
+            var filePath = path.join(base, file);
+            var data = fs.readFileSync(filePath, {'encoding': config.fileEncoding});
+            archive.file(path.relative(config.buildDir, filePath), data);
         });
+
+        var buffer = archive.generate({type:'nodebuffer', compression:'DEFLATE'});
+        var arPath = archivePath();
+        fs.writeFileSync(arPath, buffer);
+
+        if (done) { done(); }
     },
 
     install: function (done) {
@@ -142,10 +146,19 @@ var maven = {
     deploy: function (repoId, isSnapshot, done) {
         if (typeof isSnapshot == 'function') { done = isSnapshot; isSnapshot = false; }
         validateRepos(config);
+        if (config.repositories.length == 0) {
+            throw new Error('Maven repositories have to include at least one repository with ‘id’ and ‘url’.');
+        }
         config.repositories.forEach(validateRepo);
         this.package();
         mvn(['deploy:deploy-file'], repoId, isSnapshot, done);
-    }
+    },
+
+    // only for tests - do not use externally
+    _init: init,
+    _getPkg: function () { return pkg; },
+    _setPkg: function (_pkg) { pkg = _pkg; },
+    _mockExec: function (mock) { exec = mock; }
 };
 
 module.exports = maven;
